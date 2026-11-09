@@ -1,0 +1,221 @@
+package tengo
+
+import (
+	"fmt"
+	"maps"
+	"net/url"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestEscapeValueForCreateTable(t *testing.T) {
+	cases := map[string]string{
+		"":                   "",
+		"'":                  "''",
+		`"`:                  `"`,
+		`c:\somewhere\there`: `c:\\somewhere\\there`,
+		"cstring\000":        `cstring\0`,
+		"two\nlines":         `two\nlines`,
+		`goofy\'\'input`:     `goofy\\''\\''input`,
+	}
+	for input, expected := range cases {
+		if actual := EscapeValueForCreateTable(input); actual != expected {
+			t.Errorf("EscapeValueForCreateTable on %s: expected %s, found %s", input, expected, actual)
+		}
+		if roundTrip := stripAnyQuote("'" + EscapeValueForCreateTable(input) + "'"); roundTrip != input {
+			t.Errorf("Expected round-trip logic on %s to return original input, instead found %s", input, roundTrip)
+		}
+	}
+}
+
+func TestSplitHostOptionalPort(t *testing.T) {
+	assertSplit := func(addr, expectHost string, expectPort int, expectErr bool) {
+		host, port, err := SplitHostOptionalPort(addr)
+		if host != expectHost {
+			t.Errorf("Expected SplitHostOptionalPort(\"%s\") to return host of \"%s\", instead found \"%s\"", addr, expectHost, host)
+		}
+		if port != expectPort {
+			t.Errorf("Expected SplitHostOptionalPort(\"%s\") to return port of %d, instead found %d", addr, expectPort, port)
+		}
+		if expectErr && err == nil {
+			t.Errorf("Expected SplitHostOptionalPort(\"%s\") to return an error, but instead found nil", addr)
+		} else if !expectErr && err != nil {
+			t.Errorf("Expected SplitHostOptionalPort(\"%s\") to return NOT return an error, but instead found %s", addr, err)
+		}
+	}
+
+	assertSplit("", "", 0, true)
+	assertSplit("foo", "foo", 0, false)
+	assertSplit("1.2.3.4", "1.2.3.4", 0, false)
+	assertSplit("some.host:1234", "some.host", 1234, false)
+	assertSplit("some.host:text", "", 0, true)
+	assertSplit("some.host:1234:5678", "", 0, true)
+	assertSplit("some.host:0", "", 0, true)
+	assertSplit("some.host:-5", "", 0, true)
+	assertSplit("fe80::1", "", 0, true)
+	assertSplit("[fe80::1]", "[fe80::1]", 0, false)
+	assertSplit("[fe80::1]:3306", "[fe80::1]", 3306, false)
+	assertSplit("[fe80::bd0f:a8bc:6480:238b%11]", "[fe80::bd0f:a8bc:6480:238b%11]", 0, false)
+	assertSplit("[fe80::bd0f:a8bc:6480:238b%11]:443", "[fe80::bd0f:a8bc:6480:238b%11]", 443, false)
+	assertSplit("[fe80::bd0f:a8bc:6480:238b%11]:sup", "", 0, true)
+	assertSplit("[fe80::bd0f:a8bc:6480:238b%11]:123:456", "", 0, true)
+}
+
+func TestAttributeMap(t *testing.T) {
+	// Note that some tests below include AUTOEXTEND_SIZE just to cover handling of
+	// version-gate comments, but in reality AUTOEXTEND_SIZE in particular is
+	// separate from other table options anyway
+	cases := map[string]map[string]string{
+		"":                                       {},
+		"stats_persistent=1":                     {"STATS_PERSISTENT": "1"},
+		"ROW_format=DYNAMIC stats_auto_recalc=1": {"ROW_FORMAT": "DYNAMIC", "STATS_AUTO_RECALC": "1"},
+		"COMPRESSION=\"zLIB\"":                   {"COMPRESSION": "'zLIB'"}, // MySQL style page compression
+		"/*!80023 AUTOEXTEND_SIZE=8388608 */":    {"AUTOEXTEND_SIZE": "8388608"},
+		"`PAGE_compressed`=1 `page_compression_LEVEL`=9":                        {"PAGE_COMPRESSED": "1", "PAGE_COMPRESSION_LEVEL": "9"}, // MariaDB style page compression
+		"encryption='Y' /*!80023 AUTOEXTEND_SIZE=4194304 */ stats_persistent=1": {"ENCRYPTION": "'Y'", "AUTOEXTEND_SIZE": "4194304", "STATS_PERSISTENT": "1"},
+	}
+	for input, expected := range cases {
+		if actual := attributeMap(input); !maps.Equal(actual, expected) {
+			t.Errorf("Expected attributeMap(%q) to yield %v, instead found %v", input, expected, actual)
+		}
+	}
+}
+
+func TestAttributeValue(t *testing.T) {
+	cases := map[string]map[string]string{
+		"":                                       {},
+		"stats_persistent=1":                     {"STATS_PERSISTENT": "1"},
+		"ROW_format=DYNAMIC stats_auto_recalc=1": {"ROW_FORMAT": "DYNAMIC", "STATS_AUTO_RECALC": "1"},
+		"COMPRESSION=\"zLIB\"":                   {"COMPRESSION": "'zLIB'"}, // MySQL style page compression
+		"/*!80023 AUTOEXTEND_SIZE=8388608 */":    {"AUTOEXTEND_SIZE": "8388608"},
+		"`PAGE_compressed`=1 `page_compression_LEVEL`=9":                        {"PAGE_COMPRESSED": "1", "PAGE_COMPRESSION_LEVEL": "9"}, // MariaDB style page compression
+		"encryption='Y' /*!80023 AUTOEXTEND_SIZE=4194304 */ stats_persistent=1": {"ENCRYPTION": "'Y'", "AUTOEXTEND_SIZE": "4194304", "STATS_PERSISTENT": "1"},
+	}
+	for input, expected := range cases {
+		for attribute, expectedValue := range expected {
+			if actual, ok := attributeValue(input, attribute); actual != expectedValue || !ok {
+				t.Errorf("Unexpected return from attributeValue(%q, %q): expected %q, true; found %q, %t", input, attribute, expectedValue, actual, ok)
+			}
+		}
+		if actual, ok := attributeValue(input, "UNSET"); actual != "" || ok {
+			t.Errorf("Unexpected return from attributeValue(%q, \"UNSET\"): expected \"\", false; found %q, %t", input, actual, ok)
+		}
+	}
+}
+
+func TestStripVersionGates(t *testing.T) {
+	cases := map[string]string{
+		"":                        "",
+		"abc /*regular!*/ def":    "abc /*regular!*/ def",
+		"abc/*M! maria only*/def": "abcmaria onlydef",
+
+		"abc /*regular*/ /*!50700 mysql only */ 'def*/'": "abc /*regular*/ mysql only  'def*/'",
+
+		"foo /*!50100 TABLESPACE `innodb_file_per_table` */ /*!80023 AUTOEXTEND_SIZE=16777216 */ ENGINE=InnoDB": "foo TABLESPACE `innodb_file_per_table`  AUTOEXTEND_SIZE=16777216  ENGINE=InnoDB",
+	}
+	for input, expected := range cases {
+		if actual := stripVersionGates(input); actual != expected {
+			t.Errorf("Unexpected return from stripVersionGates(%q): expected %q, found %q", input, expected, actual)
+		}
+	}
+}
+
+func TestStripNonInnoAttributes(t *testing.T) {
+	input := "CREATE TABLE `problems` (\n" +
+		"  `name` varchar(30) /*!50606 STORAGE MEMORY */ /*!50606 COLUMN_FORMAT DYNAMIC */ DEFAULT NULL,\n" +
+		"  `code` char(20),\n" +
+		"  `num` int(10) unsigned NOT NULL /*!50606 STORAGE DISK */ /*!50606 COLUMN_FORMAT FIXED */,\n" +
+		"  KEY `idx1` (`name`) USING HASH KEY_BLOCK_SIZE=4 COMMENT 'lol',\n" +
+		"  KEY `idx2` (`num`) USING BTREE\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=latin1 KEY_BLOCK_SIZE=8;\n"
+	expect := "CREATE TABLE `problems` (\n" +
+		"  `name` varchar(30) DEFAULT NULL,\n" +
+		"  `code` char(20),\n" +
+		"  `num` int(10) unsigned NOT NULL,\n" +
+		"  KEY `idx1` (`name`) COMMENT 'lol',\n" +
+		"  KEY `idx2` (`num`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=latin1 KEY_BLOCK_SIZE=8;\n"
+	if actual := StripNonInnoAttributes(input); actual != expect {
+		t.Errorf("StripNonInnoAttributes returned unexpected value. Expected:\n%s\nActual:\n%s", expect, actual)
+	}
+}
+
+func TestMergeParamStrings(t *testing.T) {
+	assertParamString := func(expected string, input ...string) {
+		t.Helper()
+		// can't compare strings directly since order may be different
+		result := MergeParamStrings(input...)
+		parsedResult, err := url.ParseQuery(result)
+		if err != nil {
+			t.Fatalf("url.ParseQuery(\"%s\") returned error: %s", result, err)
+		}
+		parsedExpected, err := url.ParseQuery(expected)
+		if err != nil {
+			t.Fatalf("url.ParseQuery(\"%s\") returned error: %s", expected, err)
+		}
+		if !reflect.DeepEqual(parsedResult, parsedExpected) {
+			t.Errorf("Expected param map %v, instead found %v", parsedExpected, parsedResult)
+		}
+	}
+
+	assertParamString("")
+	assertParamString("", "", "")
+	assertParamString("param1=value1", "param1=value1")
+	assertParamString("param1=value1", "param1=value1", "")
+	assertParamString("param1=value1", "", "param1=value1")
+	assertParamString("param1=value1", "param1=value1", "param1=value1")
+	assertParamString("param1=hello&param2=ok", "param1=value1", "param1=value2&param2=ok", "param1=hello")
+	assertParamString("param1=value1&readTimeout=5s&interpolateParams=0&param2=value2", "param1=value1&readTimeout=5s&interpolateParams=0", "param2=value2")
+	assertParamString("param1=value3&readTimeout=5s&interpolateParams=0", "param1=value1&readTimeout=7s&interpolateParams=0", "readTimeout=5s", "param1=value3")
+}
+
+func TestFilterSQLMode(t *testing.T) {
+	assertResult := func(input string, filter sqlModeFilter, expected string) {
+		t.Helper()
+		if actual := FilterSQLMode(input, filter); actual != expected {
+			t.Errorf("Expected FilterSQLMode(%q, %v) to return %q, instead found %q", input, filter, expected, actual)
+		}
+	}
+
+	assertResult("", IntrospectionBadSQLModes, "")
+	assertResult("REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ANSI", IntrospectionBadSQLModes, "REAL_AS_FLOAT,PIPES_AS_CONCAT,IGNORE_SPACE")
+	assertResult("ANSI_QUOTES", IntrospectionBadSQLModes, "")
+
+	my57Default := "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
+	my80Default := "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+	mariaDefault := "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
+	assertResult(my57Default, NonPortableSQLModes, my80Default)
+	assertResult(my80Default, NonPortableSQLModes, my80Default)
+	assertResult(mariaDefault, NonPortableSQLModes, "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION")
+}
+
+func TestLongestIncreasingSubsequence(t *testing.T) {
+	cases := map[string]string{
+		"":            "",
+		"3":           "3",
+		"1 4":         "1 4",
+		"4 1":         "1",
+		"1 2 6 3 4":   "1 2 3 4",
+		"5 4 3 2 1":   "1",
+		"5 6 4 1 2 3": "1 2 3",
+	}
+	for inputStr, expectedStr := range cases {
+		var input []int
+		for inp := range strings.SplitSeq(inputStr, " ") {
+			if inp != "" {
+				i, _ := strconv.Atoi(inp)
+				input = append(input, i)
+			}
+		}
+		actual := longestIncreasingSubsequence(input)
+		var actualStrs []string
+		for _, out := range actual {
+			actualStrs = append(actualStrs, fmt.Sprintf("%d", out))
+		}
+		if actualStr := strings.Join(actualStrs, " "); actualStr != expectedStr {
+			t.Errorf("Expected longestIncreasingSubsequence(%s) to return %s, instead found %s", inputStr, expectedStr, actualStr)
+		}
+	}
+}

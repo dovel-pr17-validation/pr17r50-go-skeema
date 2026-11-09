@@ -1,0 +1,986 @@
+package tengo
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+func init() {
+	primaryIntrospectorTasks = append(primaryIntrospectorTasks, introspectTables)
+	primaryIntrospectorFixups = append(primaryIntrospectorFixups, fixupTables)
+}
+
+func introspectTables(ctx context.Context, insp *introspector) error {
+	flavor := insp.instance.Flavor()
+	query := `
+		SELECT SQL_BUFFER_RESULT
+		       table_name, table_type, table_comment,
+		       engine, table_collation, create_options
+		FROM   information_schema.tables
+		WHERE  table_schema = ?`
+	rows, err := insp.db.QueryContext(ctx, query, insp.schema.Name)
+	if err != nil {
+		return fmt.Errorf("Error querying information_schema.tables for schema %s: %w", insp.schema.Name, err)
+	}
+	defer rows.Close()
+
+	var tables []*Table
+	var havePartitions bool
+	haveAltType := make(map[string]bool, 4)
+	for rows.Next() {
+		var name, typ, comment string
+		var engine, collation, createOpts sql.NullString
+		if err := rows.Scan(&name, &typ, &comment, &engine, &collation, &createOpts); err != nil {
+			return fmt.Errorf("Error querying information_schema.tables for schema %s: %w", insp.schema.Name, err)
+		}
+		if typ != "BASE TABLE" && typ != "SYSTEM VERSIONED" {
+			haveAltType[typ] = true
+			continue
+		}
+
+		// Note that we no longer set Table.NextAutoIncrement here. information_schema
+		// potentially has bad data, e.g. a table without an auto-inc col can still
+		// have a non-NULL tables.auto_increment if the original CREATE specified one.
+		// Instead the value is parsed from SHOW CREATE TABLE.
+		table := &Table{
+			Name:            name,
+			Engine:          engine.String,
+			Collation:       collation.String,
+			CreateOptions:   strings.ToUpper(createOpts.String),
+			Comment:         comment,
+			SystemVersioned: typ == "SYSTEM VERSIONED",
+		}
+		table.CharSet, _, _ = strings.Cut(table.Collation, "_")
+		if flavor.AlwaysShowCollate() {
+			table.ShowCollation = true
+		} else if !collationIsDefault(table.Collation, table.CharSet, flavor) {
+			table.ShowCollation = true
+		} else if table.CharSet == "utf8mb4" && flavor.IsMySQL() {
+			table.ShowCollation = true
+		}
+		if table.CreateOptions != "" {
+			// Note that table.CreateOptions typically gets overwritten from a value
+			// parsed out of SHOW CREATE TABLE anyway; it is only set here as a fallback
+			if before, after, ok := strings.Cut(table.CreateOptions, "PARTITIONED"); ok {
+				havePartitions = true
+				table.CreateOptions = strings.TrimSpace(strings.TrimSpace(before) + " " + strings.TrimSpace(after))
+			}
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error querying information_schema.tables for schema %s: %w", insp.schema.Name, err)
+	}
+
+	insp.schema.Tables = tables
+
+	subtasks := make([]introspectorTask, 0, len(haveAltType)+len(tables)+5)
+	for ttype := range haveAltType {
+		if task, ok := altTableTypeTasks[ttype]; ok {
+			subtasks = append(subtasks, task)
+		}
+	}
+	for _, t := range tables {
+		subtasks = append(subtasks, t.introspectShowCreate)
+	}
+	if len(tables) > 0 {
+		subtasks = append(subtasks,
+			introspectColumns,
+			introspectIndexes,
+			introspectForeignKeys,
+		)
+		if flavor.HasCheckConstraints() {
+			subtasks = append(subtasks, introspectChecks)
+		}
+		if havePartitions {
+			subtasks = append(subtasks, introspectPartitioning)
+		}
+	}
+	for _, task := range subtasks {
+		insp.Go(ctx, task)
+	}
+	return nil
+}
+
+// fixupTables cleans up edge cases in information_schema where data must be
+// obtained from SHOW CREATE TABLE instead.
+func fixupTables(schema *Schema, flavor Flavor) {
+	for _, t := range schema.Tables {
+		if t.Partitioning != nil {
+			fixPartitioningEdgeCases(t, flavor)
+		}
+		// If table has an AUTO_INCREMENT column, the counter never starts at 0
+		if t.NextAutoIncrement == 0 && t.HasAutoIncrement() {
+			t.NextAutoIncrement = 1
+		}
+		// If multiple secondary indexes are present, parse their relative ordering
+		// from SHOW CREATE TABLE, since this isn't exposed in information_schema in
+		// generic/non-engine-specific way
+		if len(t.SecondaryIndexes) > 1 {
+			fixIndexOrder(t)
+		}
+		// Foreign keys order in I_S is unpredictable in MySQL 8.0.19+, so reorder
+		// based on parsing SHOW CREATE TABLE if needed
+		// TODOv3: early MySQL 8.0 point releases will be dropped in Skeema v3; replace with IsMySQL at that time
+		if flavor.MinMySQL(8, 0, 19) && len(t.ForeignKeys) > 1 {
+			fixForeignKeyOrder(t)
+		}
+		// Table options in I_S are not always ordered or formatted the same as in
+		// SHOW CREATE TABLE
+		if t.CreateOptions != "" && t.CreateOptions != "PARTITIONED" {
+			fixTableCreateOptions(t, flavor)
+		}
+		// Fix some MySQL charset/collation edge cases in SHOW CREATE TABLE
+		// Also MySQL generated column expressions must be reparased from SHOW CREATE
+		// TABLE to properly obtain any 4-byte chars. Additionally the I_S
+		// representation has incorrect escaping and potentially different charset
+		// in string literal introducers.
+		if flavor.IsMySQL() {
+			fixShowCharSets(t)
+			fixGenerationExpr(t, flavor)
+		}
+		// Percona Server column compression can only be parsed from SHOW CREATE
+		// TABLE. (Although it also has new I_S tables, cols that aren't using a
+		// COMPRESSION_DICTIONARY are not present there.)
+		if flavor.IsPercona() && strings.Contains(t.CreateStatement, "COLUMN_FORMAT COMPRESSED") {
+			fixPerconaColCompression(t)
+		}
+		// FULLTEXT indexes may have a PARSER clause, which isn't exposed in I_S
+		if strings.Contains(t.CreateStatement, "WITH PARSER") {
+			fixFulltextIndexParsers(t, flavor)
+		}
+		// Fix problems with I_S data for default expressions as well as functional
+		// indexes in MySQL
+		if flavor.IsMySQL() {
+			fixDefaultExpression(t, flavor)
+			fixIndexExpression(t, flavor)
+		}
+		// Fix shortcoming in I_S data for check constraints
+		if len(t.Checks) > 0 {
+			fixChecks(t, flavor)
+		}
+		// MariaDB's VECTOR indexes can have M and/or DISTANCE attributes, which
+		// aren't exposed anywhere in I_S until 13.0
+		if flavor.MinMariaDB(11, 7) && !flavor.MinMariaDB(13, 0) && strings.Contains(t.CreateStatement, "VECTOR KEY") {
+			fixVectorIndexes(t, flavor)
+		}
+
+		// Compare what we expect the create DDL to be, to determine if we support
+		// diffing for the table. (No need to remove next AUTO_INCREMENT from this
+		// comparison since the value was parsed from t.CreateStatement earlier.)
+		if t.CreateStatement != t.GeneratedCreateStatement(flavor) {
+			t.UnsupportedDDL = true
+		}
+	}
+}
+
+func (t *Table) introspectShowCreate(ctx context.Context, insp *introspector) (err error) {
+	t.CreateStatement, err = showCreateTable(ctx, insp.db, insp.schema.Name, t.Name)
+	if err != nil {
+		return fmt.Errorf("Error executing SHOW CREATE TABLE for %s.%s: %w", EscapeIdentifier(insp.schema.Name), EscapeIdentifier(t.Name), err)
+	}
+
+	// Parse TABLESPACE clause, AUTOEXTEND_SIZE clause, and AUTO_INCREMENT counter
+	// from SHOW CREATE output, if present. The first two prevent the need to query
+	// additional InnoDB-specific information_schema tables, and the latter is to
+	// avoid issues with information_schema discrepancies.
+
+	// These table options all appear on the line of SHOW CREATE TABLE which begins
+	// with a non-indented closing paren
+	_, s, _ := strings.Cut(t.CreateStatement, "\n) ")
+	if insp.instance.Flavor().IsMySQL() {
+		if rest, ok := strings.CutPrefix(s, "/*!50100 TABLESPACE `"); ok {
+			t.Tablespace, s, _ = strings.Cut(rest, "` */ ")
+		}
+		if rest, ok := strings.CutPrefix(s, "/*!80023 AUTOEXTEND_SIZE="); ok {
+			var val string
+			val, s, _ = strings.Cut(rest, " */ ")
+			t.AutoextendSize, _ = strconv.ParseUint(val, 10, 64)
+		}
+	}
+	if rest, ok := strings.CutPrefix(s, "ENGINE="+t.Engine+" AUTO_INCREMENT="); ok {
+		val, _, _ := strings.Cut(rest, " ")
+		t.NextAutoIncrement, _ = strconv.ParseUint(val, 10, 64)
+	}
+
+	// Remove column and index attributes which don't affect InnoDB
+	if t.Engine == "InnoDB" {
+		t.CreateStatement = StripNonInnoAttributes(t.CreateStatement)
+	}
+
+	return nil
+}
+
+func showCreateTable(ctx context.Context, db *sql.DB, schema, table string) (string, error) {
+	return showCreateObject(ctx, db, schema, ObjectTypeTable, table)
+}
+
+var reExtraOnUpdate = regexp.MustCompile(`(?i)\bon update (current_timestamp(?:\(\d*\))?)`)
+
+func introspectColumns(ctx context.Context, insp *introspector) error {
+	flavor := insp.instance.Flavor()
+	stripDisplayWidth := flavor.OmitIntDisplayWidth()
+	var mariaCompressedColMarker string
+	if flavor.IsMariaDB() {
+		mariaCompressedColMarker = " " + flavor.compressedColumnOpenComment() + "COMPRESSED"
+	}
+	// Note: MariaDB 13.0 added a create_options column here (see MDEV-36444) but
+	// we do not currently query it due to lack of known use for InnoDB tables.
+	query := `
+		SELECT   SQL_BUFFER_RESULT
+		         column_name, table_name, column_type, is_nullable, extra,
+		         column_comment, column_default, generation_expression,
+		         character_set_name, collation_name, srs_id
+		FROM     information_schema.columns
+		WHERE    table_schema = ?
+		ORDER BY table_name, ordinal_position`
+
+	// MariaDB does not expose SRIDs in I_S.columns. In theory we could get them
+	// from I_S.geometry_columns.srid instead, but since MariaDB does not expose
+	// its REF_SYSTEM_ID attribute in SHOW CREATE TABLE there's currently no point
+	// in querying them, especially as they are not used in calculations (per the
+	// MariaDB manual entry for the st_srid function)
+	if !flavor.IsMySQL() {
+		query = strings.Replace(query, "srs_id", "NULL AS srs_id", 1)
+	}
+
+	rows, err := insp.db.QueryContext(ctx, query, insp.schema.Name)
+	if err != nil {
+		return fmt.Errorf("Error querying information_schema.columns for schema %s: %w", insp.schema.Name, err)
+	}
+	defer rows.Close()
+	columnsByTableName := make(map[string][]*Column)
+	for rows.Next() {
+		var colName, tableName, typ, nullable, extra, comment string
+		var colDefault, generated, charSet, collation sql.NullString
+		var srid sql.NullInt64
+		err := rows.Scan(&colName, &tableName, &typ, &nullable, &extra, &comment, &colDefault, &generated, &charSet, &collation, &srid)
+		if err != nil {
+			return fmt.Errorf("Error querying information_schema.columns for schema %s: %w", insp.schema.Name, err)
+		}
+
+		// MariaDB includes compression attribute in column type; remove it BEFORE
+		// parsing the column type
+		var mariaCompressedColumn bool
+		if mariaCompressedColMarker != "" {
+			typ, _, mariaCompressedColumn = strings.Cut(typ, mariaCompressedColMarker)
+		}
+
+		col := &Column{
+			Name:          colName,
+			Type:          ParseColumnType(typ),
+			Nullable:      strings.EqualFold(nullable, "YES"),
+			AutoIncrement: strings.Contains(extra, "auto_increment"),
+			Comment:       comment,
+			Invisible:     strings.Contains(extra, "INVISIBLE"),
+		}
+		if mariaCompressedColumn {
+			col.Compression = "COMPRESSED"
+		}
+
+		// If db was upgraded from a pre-8.0.19 version (but still 8.0+) to 8.0.19+,
+		// I_S may still contain int display widths even though SHOW CREATE TABLE
+		// omits them. Strip to avoid incorrectly flagging the table as unsupported
+		// for diffs.
+		if stripDisplayWidth {
+			col.Type.StripDisplayWidth() // safe/no-op if already no int display width
+		}
+		if generated.Valid {
+			col.GenerationExpr = generated.String
+			col.Virtual = strings.Contains(extra, "VIRTUAL GENERATED")
+		}
+		if !colDefault.Valid {
+			allowNullDefault := col.Nullable && !col.AutoIncrement && col.GenerationExpr == ""
+			// Only MariaDB allows blob/text default literals, including explicit DEFAULT
+			// NULL clause.
+			// MySQL 8.0.13+ does allow default *expressions* for these col types, but
+			// 8.0.13-8.0.22 erroneously omits them from I_S, so we need to catch this
+			// situation and parse from SHOW CREATE later.
+			// TODOv3: these early point releases of MySQL 8 will be dropped in Skeema v3
+			if !flavor.IsMariaDB() && (strings.HasSuffix(col.Type.Base, "blob") || strings.HasSuffix(col.Type.Base, "text")) {
+				allowNullDefault = false
+				if strings.Contains(extra, "DEFAULT_GENERATED") {
+					col.Default = "(!!!BLOBDEFAULT!!!)"
+				}
+			}
+			if allowNullDefault {
+				col.Default = "NULL"
+			}
+		} else if flavor.IsMariaDB() { // MariaDB exposes defaults as expressions / quote-wrapped strings
+			if !col.AutoIncrement && col.GenerationExpr == "" {
+				col.Default = colDefault.String
+			}
+		} else if strings.HasPrefix(colDefault.String, "CURRENT_TIMESTAMP") && (strings.HasPrefix(typ, "timestamp") || strings.HasPrefix(typ, "datetime")) {
+			col.Default = colDefault.String
+		} else if strings.HasPrefix(typ, "bit") && strings.HasPrefix(colDefault.String, "b'") {
+			col.Default = colDefault.String
+		} else if strings.Contains(extra, "DEFAULT_GENERATED") {
+			// MySQL 8.0.13+ supports default expressions, which are paren-wrapped in
+			// SHOW CREATE TABLE in MySQL. However MySQL I_S data has some issues for
+			// default expressions. The most common one is fixed here, and if additional
+			// mismatches remain, they get corrected by fixDefaultExpression later on.
+			// TODOv3: early point releases of MySQL 8 will be dropped in Skeema v3
+			col.Default = "(" + strings.ReplaceAll(colDefault.String, "\\'", "'") + ")"
+		} else {
+			col.Default = "'" + EscapeValueForCreateTable(colDefault.String) + "'"
+		}
+		if matches := reExtraOnUpdate.FindStringSubmatch(extra); matches != nil {
+			col.OnUpdate = matches[1]
+			// Some flavors omit fractional precision from ON UPDATE in
+			// information_schema only, despite it being present everywhere else
+			if openParen := strings.IndexByte(typ, '('); openParen > -1 && !strings.Contains(col.OnUpdate, "(") {
+				col.OnUpdate = col.OnUpdate + typ[openParen:]
+			}
+		}
+		if collation.Valid { // only text-based column types have a notion of charset and collation
+			col.CharSet = charSet.String
+			col.Collation = collation.String
+			// note: fields ShowCharSet and ShowCollation are set by caller, since these
+			// require comparing things to the table's defaults, and we don't have the
+			// full table here
+		}
+		if srid.Valid { // Spatial columns in MySQL 8+ can have optional SRID
+			col.HasSpatialReference = true
+			col.SpatialReferenceID = uint32(srid.Int64)
+		}
+		columnsByTableName[tableName] = append(columnsByTableName[tableName], col)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error querying information_schema.columns for schema %s: %w", insp.schema.Name, err)
+	}
+
+	// Place the columns into the tables in insp.schema
+	for _, t := range insp.schema.Tables {
+		t.Columns = columnsByTableName[t.Name]
+		for _, col := range t.Columns {
+			// Set ShowCharSet and ShowCollation for each column as appropriate. This
+			// isn't handled by queryColumnsInSchema because it requires the full table.
+			if col.Collation != "" {
+				// Column-level CHARACTER SET shown whenever the *collation* differs from
+				// table's default
+				col.ShowCharSet = (col.Collation != t.Collation)
+				if flavor.AlwaysShowCollate() {
+					// Since Nov 2022, MariaDB always shows a COLLATE clause if showing charset
+					col.ShowCollation = col.ShowCharSet
+				} else {
+					// Other flavors show a COLLATE clause whenever the collation isn't the
+					// default one for the charset.
+					col.ShowCollation = !collationIsDefault(col.Collation, col.CharSet, flavor)
+				}
+				// Note: MySQL 8 has additional edge cases for both ShowCharSet and
+				// ShowCollation, both of which are handled later in fixShowCharSets
+			}
+		}
+	}
+	return nil
+}
+
+func introspectIndexes(ctx context.Context, insp *introspector) error {
+	query := `
+		SELECT   SQL_BUFFER_RESULT
+		         index_name, table_name, index_type, %s AS is_visible, index_comment,
+		         non_unique, seq_in_index, sub_part, column_name, collation,
+		         %s AS expression, %s AS create_options
+		FROM     information_schema.statistics
+		WHERE    table_schema = ?
+		ORDER BY table_name, index_name, seq_in_index`
+	visSelect, exprSelect, optSelect := "'YES'", "NULL", "''"
+	if flavor := insp.instance.Flavor(); flavor.IsMySQL() {
+		// Index expressions in MySQL 8.0.13+; not present in MariaDB
+		// TODOv3: early point releases of MySQL 8 will be dropped, so we can always assume this is true
+		if flavor.MinMySQL(8, 0, 13) {
+			exprSelect = "expression"
+		}
+		visSelect = "is_visible" // available in all 8.0
+	} else if flavor.MinMariaDB(10, 6) {
+		// MariaDB I_S uses the inverse: YES for ignored (invisible), NO for visible
+		visSelect = "IF(ignored = 'YES', 'NO', 'YES')"
+		if flavor.MinMariaDB(13, 0) {
+			optSelect = "create_options" // see MDEV-36444
+		}
+	}
+	query = fmt.Sprintf(query, visSelect, exprSelect, optSelect)
+	rows, err := insp.db.QueryContext(ctx, query, insp.schema.Name)
+	if err != nil {
+		return fmt.Errorf("Error querying information_schema.statistics for schema %s: %v", insp.schema.Name, err)
+	}
+	defer rows.Close()
+
+	primaryKeyByTableName := make(map[string]*Index)
+	secondaryIndexesByTableName := make(map[string][]*Index)
+	indexesByTableAndName := make(map[string]*Index) // used for stitching together multi-part indexes
+	for rows.Next() {
+		var idxName, tableName, idxType, visible, comment, createOptions string
+		var nonUnique, seq uint8
+		var subPart sql.NullInt64
+		var colName, direction, expr sql.NullString
+		err := rows.Scan(&idxName, &tableName, &idxType, &visible, &comment, &nonUnique, &seq, &subPart, &colName, &direction, &expr, &createOptions)
+		if err != nil {
+			return fmt.Errorf("Error querying information_schema.statistics for schema %s: %v", insp.schema.Name, err)
+		}
+
+		part := IndexPart{
+			ColumnName: colName.String,
+			Expression: expr.String,
+			Descending: (direction.String == "D"),
+		}
+		if idxType != "SPATIAL" { // Sub-part value only used for non-SPATIAL indexes
+			part.PrefixLength = uint16(subPart.Int64)
+		}
+
+		// Multi-part indexes have 1 row per part. If this isn't the first part, look
+		// up pointer to the existing Index and add the part.
+		key := tableName + "." + idxName
+		if seq > 1 {
+			index := indexesByTableAndName[key]
+			index.Parts = append(index.Parts, part)
+			continue
+		}
+
+		index := &Index{
+			Name:       idxName,
+			Unique:     nonUnique == 0,
+			Comment:    comment,
+			Type:       idxType,
+			Invisible:  (visible == "NO"),
+			Parts:      []IndexPart{part},
+			Attributes: createOptions,
+		}
+		if strings.EqualFold(idxName, "PRIMARY") {
+			index.PrimaryKey = true
+			primaryKeyByTableName[tableName] = index
+		} else {
+			secondaryIndexesByTableName[tableName] = append(secondaryIndexesByTableName[tableName], index)
+		}
+		indexesByTableAndName[key] = index
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error querying information_schema.statistics for schema %s: %v", insp.schema.Name, err)
+	}
+
+	for _, t := range insp.schema.Tables {
+		t.PrimaryKey = primaryKeyByTableName[t.Name]
+		t.SecondaryIndexes = secondaryIndexesByTableName[t.Name]
+	}
+	return nil
+}
+
+func introspectForeignKeys(ctx context.Context, insp *introspector) error {
+	query := `
+		SELECT   SQL_BUFFER_RESULT
+		         rc.constraint_name, rc.table_name, kcu.column_name, rc.update_rule,
+		         rc.delete_rule, rc.referenced_table_name, kcu.referenced_column_name,
+		         rc.unique_constraint_schema AS referenced_schema
+		FROM     information_schema.referential_constraints rc
+		JOIN     information_schema.key_column_usage kcu ON
+		         kcu.constraint_name = rc.constraint_name AND
+		         kcu.table_schema = ? AND kcu.referenced_column_name IS NOT NULL
+		WHERE    rc.constraint_schema = ?
+		ORDER BY BINARY rc.constraint_name, kcu.ordinal_position`
+	rows, err := insp.db.QueryContext(ctx, query, insp.schema.Name, insp.schema.Name)
+	if err != nil {
+		return fmt.Errorf("Error querying foreign key constraints for schema %s: %v", insp.schema.Name, err)
+	}
+	defer rows.Close()
+	foreignKeysByTableName := make(map[string][]*ForeignKey)
+	foreignKeysByName := make(map[string]*ForeignKey)
+	for rows.Next() {
+		var fkName, childTable, childCol, updateRule, deleteRule, parentTable, parentCol, parentSchema string
+		err := rows.Scan(&fkName, &childTable, &childCol, &updateRule, &deleteRule, &parentTable, &parentCol, &parentSchema)
+		if err != nil {
+			return fmt.Errorf("Error querying foreign key constraints for schema %s: %v", insp.schema.Name, err)
+		}
+		if fk, already := foreignKeysByName[fkName]; already { // multi-col FK, already processed first col
+			fk.ColumnNames = append(fk.ColumnNames, childCol)
+			fk.ReferencedColumnNames = append(fk.ReferencedColumnNames, parentCol)
+			continue
+		}
+		foreignKey := &ForeignKey{
+			Name:                  fkName,
+			ReferencedTableName:   parentTable,
+			UpdateRule:            updateRule,
+			DeleteRule:            deleteRule,
+			ColumnNames:           []string{childCol},
+			ReferencedColumnNames: []string{parentCol},
+		}
+		if parentSchema != insp.schema.Name &&
+			(insp.instance.NameCaseMode() == NameCaseAsIs || !strings.EqualFold(parentSchema, insp.schema.Name)) {
+			// Only store the parent schema name for cross-schema FKs
+			foreignKey.ReferencedSchemaName = parentSchema
+		}
+		foreignKeysByName[fkName] = foreignKey
+		foreignKeysByTableName[childTable] = append(foreignKeysByTableName[childTable], foreignKey)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error querying foreign key constraints for schema %s: %v", insp.schema.Name, err)
+	}
+	if len(foreignKeysByTableName) > 0 {
+		for _, t := range insp.schema.Tables {
+			t.ForeignKeys = foreignKeysByTableName[t.Name]
+		}
+	}
+	return nil
+}
+
+func introspectChecks(ctx context.Context, insp *introspector) error {
+	// With MariaDB, information_schema.check_constraints has what we need. But
+	// nothing in I_S reveals differences between inline-column checks and regular
+	// checks, so that is handled separately by parsing SHOW CREATE TABLE later in
+	// a fixup function. Also intentionally no ORDER BY in this query; the returned
+	// order matches that of SHOW CREATE TABLE (which isn't usually alphabetical).
+	//
+	// With MySQL, we need to get table names and enforcement status from
+	// information_schema.table_constraints. We don't even bother querying
+	// information_schema.check_constraints because the clause value there has
+	// broken double-escaping logic. Instead we parse bodies from SHOW CREATE
+	// TABLE separately in a fixup function.
+	var query string
+	if insp.instance.Flavor().IsMariaDB() {
+		query = `
+			SELECT   SQL_BUFFER_RESULT
+			         constraint_name, check_clause, table_name, 'YES' AS enforced
+			FROM     information_schema.check_constraints
+			WHERE    constraint_schema = ?`
+	} else {
+		query = `
+			SELECT   SQL_BUFFER_RESULT
+			         constraint_name, '' AS check_clause, table_name, enforced
+			FROM     information_schema.table_constraints
+			WHERE    table_schema = ? AND constraint_type = 'CHECK'
+			ORDER BY table_name, constraint_name`
+	}
+	rows, err := insp.db.QueryContext(ctx, query, insp.schema.Name)
+	if err != nil {
+		return fmt.Errorf("Error querying CHECK constraints for schema %s: %s", insp.schema.Name, err)
+	}
+	defer rows.Close()
+	checksByTableName := make(map[string][]*Check)
+	for rows.Next() {
+		var checkName, clause, tableName, enforced string
+		err := rows.Scan(&checkName, &clause, &tableName, &enforced)
+		if err != nil {
+			return fmt.Errorf("Error querying CHECK constraints for schema %s: %v", insp.schema.Name, err)
+		}
+		checksByTableName[tableName] = append(checksByTableName[tableName], &Check{
+			Name:     checkName,
+			Clause:   clause,
+			Enforced: !strings.EqualFold(enforced, "NO"),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error querying CHECK constraints for schema %s: %v", insp.schema.Name, err)
+	}
+	if len(checksByTableName) > 0 {
+		for _, t := range insp.schema.Tables {
+			t.Checks = checksByTableName[t.Name]
+		}
+	}
+	return nil
+}
+
+func introspectPartitioning(ctx context.Context, insp *introspector) error {
+	query := `
+		SELECT   SQL_BUFFER_RESULT
+		         table_name, partition_name, partition_method, partition_comment,
+		         partition_expression, partition_description,
+		         subpartition_name, subpartition_method, subpartition_expression
+		FROM     information_schema.partitions
+		WHERE    table_schema = ? AND partition_name IS NOT NULL
+		ORDER BY table_name, partition_ordinal_position, subpartition_ordinal_position`
+	rows, err := insp.db.QueryContext(ctx, query, insp.schema.Name)
+	if err != nil {
+		return fmt.Errorf("Error querying information_schema.partitions for schema %s: %v", insp.schema.Name, err)
+	}
+	defer rows.Close()
+	partitioningByTableName := make(map[string]*TablePartitioning)
+	for rows.Next() {
+		var tableName, partitionName, method, comment string
+		var expression, values, subName, subMethod, subExpression sql.NullString
+		err := rows.Scan(&tableName, &partitionName, &method, &comment, &expression, &values, &subName, &subMethod, &subExpression)
+		if err != nil {
+			return fmt.Errorf("Error querying information_schema.partitions for schema %s: %v", insp.schema.Name, err)
+		}
+		p, ok := partitioningByTableName[tableName]
+		if !ok {
+			p = &TablePartitioning{
+				Method:        method,
+				SubMethod:     subMethod.String,
+				Expression:    expression.String,
+				SubExpression: subExpression.String,
+			}
+			partitioningByTableName[tableName] = p
+		}
+		p.Partitions = append(p.Partitions, &Partition{
+			Name:    partitionName,
+			SubName: subName.String,
+			Values:  values.String,
+			Comment: comment,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("Error querying information_schema.partitions for schema %s: %v", insp.schema.Name, err)
+	}
+	if len(partitioningByTableName) > 0 {
+		for _, t := range insp.schema.Tables {
+			if p, ok := partitioningByTableName[t.Name]; ok {
+				for _, part := range p.Partitions {
+					part.Engine = t.Engine
+				}
+				t.Partitioning = p
+			}
+		}
+	}
+	return nil
+}
+
+// The display order of secondary indexes in SHOW CREATE TABLE is not reflected
+// in any non-storage-engine-specific information_schema tables. This function
+// adjusts the order in the Table.SecondaryIndexes field to match the ordering
+// from SHOW CREATE TABLE.
+func fixIndexOrder(t *Table) {
+	byName := t.SecondaryIndexesByName()
+	t.SecondaryIndexes = make([]*Index, len(byName))
+	var cur int
+	for line := range strings.SplitSeq(t.CreateStatement, "\n") {
+		if !strings.Contains(line, " KEY `") {
+			continue
+		}
+		tokens := TokenizeStringN(line, 3)
+		if len(tokens) < 3 {
+			continue
+		}
+		var indexName string
+		if tokens[0] == "KEY" {
+			indexName = stripBackticks(tokens[1])
+		} else if tokens[0] != "PRIMARY" && tokens[1] == "KEY" { // tokens[0] is e.g. "UNIQUE", "FULLTEXT", "SPATIAL"
+			indexName = stripBackticks(tokens[2])
+		}
+		if indexName != "" {
+			if idx, ok := byName[indexName]; ok {
+				t.SecondaryIndexes[cur] = idx
+				cur++
+			}
+		}
+	}
+	if cur != len(byName) {
+		panic(fmt.Errorf("Failed to parse indexes of %s for reordering: only matched %d of %d secondary indexes", t.Name, cur, len(byName)))
+	}
+}
+
+var reForeignKeyLine = regexp.MustCompile("^\\s+CONSTRAINT `((?:[^`]|``)+)` FOREIGN KEY")
+
+// Some flavors simply alphabetize foreign keys, but others do not. For ones
+// that don't, this function fixes the struct to match SHOW CREATE TABLE's order
+func fixForeignKeyOrder(t *Table) {
+	byName := t.foreignKeysByName()
+	t.ForeignKeys = make([]*ForeignKey, len(byName))
+	var cur int
+	for line := range strings.SplitSeq(t.CreateStatement, "\n") {
+		matches := reForeignKeyLine.FindStringSubmatch(line)
+		if matches == nil {
+			continue
+		}
+		t.ForeignKeys[cur] = byName[matches[1]]
+		cur++
+	}
+}
+
+// Table options in information_schema have several discrepancies relative to
+// SHOW CREATE TABLE, so this function attempts to parse the value from SHOW
+// CREATE TABLE.
+func fixTableCreateOptions(t *Table, flavor Flavor) {
+	// In SHOW CREATE TABLE, options start right after the default charset clause.
+	// After options, typically it's end-of-string, but could instead be a COMMENT
+	// clause, WITH SYSTEM VERSIONING clause, or a newline before a PARTITION BY
+	// clause.
+	charSetClause := t.defaultCharSetClause(flavor)
+	start := strings.Index(t.CreateStatement, charSetClause) + len(charSetClause) + 1
+	end := len(t.CreateStatement)
+	if t.Comment != "" {
+		end = strings.Index(t.CreateStatement[start:], " COMMENT='") + start
+	} else if t.SystemVersioned {
+		end = strings.Index(t.CreateStatement[start:], " WITH SYSTEM VERSIONING") + start
+	} else if t.Partitioning != nil {
+		end = strings.IndexRune(t.CreateStatement[start:], '\n') + start
+	}
+
+	// Above calls to strings.Index should always return correct results with SHOW
+	// CREATE TABLE behavior from all known server versions, but validate anyway
+	// just for robustness. If this somehow fails, we just leave CreateOptions
+	// as-is, potentially resulting in the table being unsupported for diffs.
+	if start > len(charSetClause) && start < end {
+		t.CreateOptions = t.CreateStatement[start:end]
+	}
+}
+
+// fixShowCharSets parses SHOW CREATE TABLE to set ShowCharSet and ShowCollation
+// for columns when needed in MySQL 8:
+//
+// Prior to MySQL 8, the logic behind inclusion of column-level CHARACTER SET
+// and COLLATE clauses in SHOW CREATE TABLE was weird but straightforward:
+// CHARACTER SET was included whenever the col's *collation* differed from the
+// table's default; COLLATION was included whenever the col's collation differed
+// from the default collation *of the col's charset*.
+//
+// MySQL 8 includes these clauses unnecessarily in additional situations:
+//   - 8.0 includes column-level character sets and collations whenever specified
+//     explicitly in the original CREATE, even when equal to the table's defaults
+//   - Tables upgraded from pre-8.0 may omit COLLATE if it's the default for the
+//     charset, while tables created in 8.0 will generally include it whenever a
+//     CHARACTER SET is shown in a column definition
+func fixShowCharSets(t *Table) {
+	lines := strings.Split(t.CreateStatement, "\n")
+	for n, col := range t.Columns {
+		if col.CharSet == "" || col.Collation == "" {
+			continue // non-character-based column type, nothing to do
+		}
+		line := lines[n+1] // columns start on second line of CREATE TABLE
+		if !col.ShowCharSet && strings.Contains(line, "CHARACTER SET "+col.CharSet) {
+			col.ShowCharSet = true
+		}
+		if !col.ShowCollation && strings.Contains(line, "COLLATE "+col.Collation) {
+			col.ShowCollation = true
+		}
+	}
+}
+
+// MySQL supports generated columns, but mangles them in I_S in various ways:
+//   - 4-byte characters are not returned properly in I_S since it uses utf8mb3
+//   - Escaping of single quotes is mangled in the I_S value
+//   - Charset introducers for string literals potentially differ between I_S
+//     and SHOW CREATE
+//
+// This method modifies each generated Column.GenerationExpr to match SHOW
+// CREATE's version.
+func fixGenerationExpr(t *Table, flavor Flavor) {
+	for _, col := range t.Columns {
+		if col.GenerationExpr == "" {
+			continue
+		}
+		if colDefinition := col.Definition(flavor); !strings.Contains(t.CreateStatement, colDefinition) {
+			var genKind string
+			if col.Virtual {
+				genKind = "VIRTUAL"
+			} else {
+				genKind = "STORED"
+			}
+			reTemplate := `(?m)^\s*` + regexp.QuoteMeta(EscapeIdentifier(col.Name)) + `.+GENERATED ALWAYS AS \((.+)\) ` + genKind
+			re := regexp.MustCompile(reTemplate)
+			if matches := re.FindStringSubmatch(t.CreateStatement); matches != nil {
+				col.GenerationExpr = matches[1]
+			}
+		}
+	}
+}
+
+// fixPartitioningEdgeCases handles situations that are reflected in SHOW CREATE
+// TABLE, but missing (or difficult to obtain) in information_schema.
+func fixPartitioningEdgeCases(t *Table, flavor Flavor) {
+	// Handle edge cases for how partitions are expressed in HASH or KEY methods:
+	// typically this will just be a PARTITIONS N clause, but it could also be
+	// nothing at all, or an explicit list of partitions, depending on how the
+	// partitioning was originally created.
+	if strings.HasSuffix(t.Partitioning.Method, "HASH") || strings.HasSuffix(t.Partitioning.Method, "KEY") {
+		countClause := fmt.Sprintf("\nPARTITIONS %d", len(t.Partitioning.Partitions))
+		if strings.Contains(t.CreateStatement, countClause) {
+			t.Partitioning.ForcePartitionList = PartitionListCount
+		} else if strings.Contains(t.CreateStatement, "\n(PARTITION ") {
+			t.Partitioning.ForcePartitionList = PartitionListExplicit
+		} else if len(t.Partitioning.Partitions) == 1 {
+			t.Partitioning.ForcePartitionList = PartitionListNone
+		}
+	}
+
+	// KEY methods support an optional ALGORITHM clause, which is present in SHOW
+	// CREATE TABLE but not anywhere in information_schema
+	if strings.HasSuffix(t.Partitioning.Method, "KEY") && strings.Contains(t.CreateStatement, "ALGORITHM") {
+		re := regexp.MustCompile(fmt.Sprintf(`PARTITION BY %s ([^(]*)\(`, t.Partitioning.Method))
+		if matches := re.FindStringSubmatch(t.CreateStatement); matches != nil {
+			t.Partitioning.AlgoClause = matches[1]
+		}
+	}
+
+	// Process DATA DIRECTORY clauses, which are easier to parse from SHOW CREATE
+	// TABLE instead of information_schema.innodb_sys_tablespaces.
+	if (t.Partitioning.ForcePartitionList == PartitionListDefault || t.Partitioning.ForcePartitionList == PartitionListExplicit) &&
+		strings.Contains(t.CreateStatement, " DATA DIRECTORY = ") {
+		for _, p := range t.Partitioning.Partitions {
+			name := p.Name
+			if flavor.IsMariaDB() {
+				name = EscapeIdentifier(name)
+			}
+			name = regexp.QuoteMeta(name)
+			re := regexp.MustCompile(fmt.Sprintf(`PARTITION %s .*DATA DIRECTORY = '((?:\\\\|\\'|''|[^'])*)'`, name))
+			if matches := re.FindStringSubmatch(t.CreateStatement); matches != nil {
+				p.DataDir = matches[1]
+			}
+		}
+	}
+}
+
+var rePerconaColCompressionLine = regexp.MustCompile("^\\s+`((?:[^`]|``)+)` .* /\\*!50633 COLUMN_FORMAT (COMPRESSED[^*]*) \\*/")
+
+// fixPerconaColCompression parses the table's CREATE string in order to
+// populate Column.Compression for columns that are using Percona Server's
+// column compression feature, which isn't reflected in information_schema.
+func fixPerconaColCompression(t *Table) {
+	colsByName := t.ColumnsByName()
+	for line := range strings.SplitSeq(t.CreateStatement, "\n") {
+		matches := rePerconaColCompressionLine.FindStringSubmatch(line)
+		if matches == nil {
+			continue
+		}
+		colsByName[matches[1]].Compression = matches[2]
+	}
+}
+
+// fixFulltextIndexParsers parses the table's CREATE string in order to
+// populate Index.FullTextParser for any fulltext indexes that specify a parser.
+func fixFulltextIndexParsers(t *Table, flavor Flavor) {
+	for _, idx := range t.SecondaryIndexes {
+		if idx.Type == "FULLTEXT" {
+			// Obtain properly-formatted index definition without parser clause, and
+			// then build a regex from this which captures the parser name.
+			var template string
+			if flavor.MinMariaDB(11, 7) {
+				template = idx.Definition(flavor) + " WITH PARSER "
+			} else {
+				template = idx.Definition(flavor) + " /*!50100 WITH PARSER "
+			}
+			template = regexp.QuoteMeta(template)
+			template += "`([^`]+)`"
+			re := regexp.MustCompile(template)
+			matches := re.FindStringSubmatch(t.CreateStatement)
+			if matches != nil { // only matches if a parser is specified
+				idx.FullTextParser = matches[1]
+			}
+		}
+	}
+}
+
+// fixDefaultExpression parses the table's CREATE string in order to correct
+// problems in Column.Default for columns using a default expression in MySQL 8:
+//   - In MySQL 8.0.13-8.0.22, blob/text cols may have default expressions but
+//     these are omitted from I_S due to a bug fixed in MySQL 8.0.23.
+//   - 4-byte characters are not returned properly in I_S since it uses utf8mb3
+//   - MySQL 8 incorrectly mangles escaping of single quotes in the I_S value
+//   - MySQL 8 potentially uses different charsets introducers for string literals
+//     in I_S vs SHOW CREATE
+//
+// It also fixes problems with BINARY / VARBINARY literal constant defaults in
+// MySQL 8, as these are also mangled by I_S if a zero byte is present.
+func fixDefaultExpression(t *Table, flavor Flavor) {
+	for _, col := range t.Columns {
+		if col.Default == "" {
+			continue
+		}
+		var matcher string
+		if col.Default[0] == '(' {
+			matcher = `.+DEFAULT (\(.+\))`
+		} else if strings.HasPrefix(col.Default, "'0x") && (col.Type.Base == "binary" || col.Type.Base == "varbinary") {
+			matcher = `.+DEFAULT ('(''|[^'])*')`
+		} else {
+			continue
+		}
+		if colDefinition := col.Definition(flavor); !strings.Contains(t.CreateStatement, colDefinition) {
+			defaultClause := " DEFAULT " + col.Default
+			after := colDefinition[strings.Index(colDefinition, defaultClause)+len(defaultClause):]
+			reTemplate := `(?m)^\s*` + regexp.QuoteMeta(EscapeIdentifier(col.Name)) + matcher + regexp.QuoteMeta(after)
+			re := regexp.MustCompile(reTemplate)
+			if matches := re.FindStringSubmatch(t.CreateStatement); matches != nil {
+				col.Default = matches[1]
+			}
+		}
+	}
+}
+
+// fixIndexExpression parses the table's CREATE string in order to correct
+// problems in index expressions (functional indexes) in MySQL 8:
+// * 4-byte characters are not returned properly in I_S since it uses utf8mb3
+// * MySQL 8 incorrectly mangles escaping of single quotes in the I_S value
+func fixIndexExpression(t *Table, flavor Flavor) {
+	// Only need to check secondary indexes, since PK can't contain expressions
+	for _, idx := range t.SecondaryIndexes {
+		if !idx.Functional() {
+			continue
+		}
+		if idxDefinition := idx.Definition(flavor); !strings.Contains(t.CreateStatement, idxDefinition) {
+			exprParts := make([]*IndexPart, 0, len(idx.Parts))
+			for n := range idx.Parts {
+				if idx.Parts[n].Expression != "" {
+					idxDefinition = strings.Replace(idxDefinition, idx.Parts[n].Expression, "!!!EXPR!!!", 1)
+					exprParts = append(exprParts, &idx.Parts[n])
+				}
+			}
+			// Build a regex which captures just the index expression(s) for this index
+			reTemplate := regexp.QuoteMeta(idxDefinition)
+			reTemplate = `(?m)^\s*` + strings.ReplaceAll(reTemplate, "!!!EXPR!!!", "(.*)") + `,?$`
+			re := regexp.MustCompile(reTemplate)
+			matches := re.FindStringSubmatch(t.CreateStatement)
+			for n := 1; n < len(matches); n++ {
+				exprParts[n-1].Expression = matches[n]
+			}
+		}
+	}
+}
+
+// fixChecks handles the problematic information_schema data for check
+// constraints, which is faulty in both MySQL and MariaDB but in different ways.
+func fixChecks(t *Table, flavor Flavor) {
+	// MariaDB handles CHECKs differently when they're defined inline in a column
+	// definition: in this case I_S shows them having a name equal to the column
+	// name, but cannot be manipulated using this name directly, nor does this
+	// prevent explicitly-named checks from also having that same name.
+	// Some old versions of MariaDB also truncate the check clause at 64 bytes in
+	// I_S (see MDEV-24139, affects various older dot releases of 10.2-10.5), so
+	// we must parse longer checks from SHOW CREATE TABLE.
+	if flavor.IsMariaDB() {
+		colsByName := t.ColumnsByName()
+		var keep []*Check
+		for _, cc := range t.Checks {
+			if len(cc.Clause) == 64 {
+				cc.fixFromShowCreate(t, flavor)
+			}
+			if col, ok := colsByName[cc.Name]; ok && !strings.Contains(t.CreateStatement, cc.Definition(flavor)) {
+				col.CheckClause = cc.Clause
+			} else {
+				keep = append(keep, cc)
+			}
+		}
+		t.Checks = keep
+		return
+	}
+
+	// Meanwhile, MySQL butchers the escaping of special characters in check
+	// clauses I_S, so we parse them from SHOW CREATE TABLE instead
+	for _, cc := range t.Checks {
+		cc.fixFromShowCreate(t, flavor)
+	}
+}
+
+// fixVectorIndexes examines SHOW CREATE TABLE to obtain the optional M and
+// DISTANCE attributes for MariaDB vector indexes. Although vector indexes
+// were added in MariaDB 11.7+, these attributes are not exposed anywhere in
+// information_schema until MariaDB 13.0.
+func fixVectorIndexes(t *Table, flavor Flavor) {
+	for _, idx := range t.SecondaryIndexes {
+		if idx.Type != "VECTOR" {
+			continue
+		}
+		definition := idx.Definition(flavor)
+		if indexStartPos := strings.Index(t.CreateStatement, definition+" "); indexStartPos > -1 {
+			attribStart := indexStartPos + len(definition) + 1
+			if newlinePos := strings.IndexByte(t.CreateStatement[attribStart:], '\n'); newlinePos > -1 {
+				attribEnd := attribStart + newlinePos
+				if t.CreateStatement[attribEnd-1] == ',' {
+					attribEnd--
+				}
+				idx.Attributes = t.CreateStatement[attribStart:attribEnd]
+			}
+		}
+	}
+}

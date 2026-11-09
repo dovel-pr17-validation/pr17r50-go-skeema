@@ -1,0 +1,75 @@
+version: 2
+builds:
+  - 
+    binary: skeema
+    env:
+      - CGO_ENABLED=0
+    mod_timestamp: "{{.CommitTimestamp}}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.CommitDate}}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_arm64
+archives:
+  - 
+    name_template: >-
+      {{- .ProjectName }}_
+      {{- .Version }}_
+      {{- if eq .Os "darwin" }}mac{{ else }}{{ .Os }}{{ end }}_
+      {{- .Arch }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: darwin
+        formats: ["zip"]
+checksum:
+  name_template: '{{ .ProjectName }}_checksums_{{ .Version }}.txt'
+snapshot:
+  version_template: "{{ .Tag }}-next"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+    - '^docs:'
+    - '^help'
+    - '^internal'
+    - '^chore:'
+    - '^test'
+    - '^ci:'
+    - '^modules:'
+    - '^dependencies:'
+    - '^version bump'
+nfpms:
+  -
+    file_name_template: '{{ .ProjectName }}_{{ .Arch }}'
+    homepage:  https://www.skeema.io
+    description: Declarative schema management CLI for MySQL and MariaDB
+    maintainer: Evan Elias <evan@skeema.net>
+    license: Apache 2.0
+    vendor: Skeema LLC
+    formats:
+      - deb
+      - rpm
+      - apk
+homebrew_casks:
+  -
+    name: skeema
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/skeema"]
+          end
+    repository:
+      owner: skeema
+      name: homebrew-tap
+    commit_author:
+      name: goreleaser
+      email: bot@skeema.net
+    url:
+      verified: github.com/skeema/skeema/
+    homepage: https://www.skeema.io
+    description: Declarative schema management CLI for MySQL and MariaDB

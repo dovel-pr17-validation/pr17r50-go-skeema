@@ -1,0 +1,212 @@
+package workspace
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/skeema/skeema/internal/tengo"
+)
+
+func (s WorkspaceIntegrationSuite) TestTempSchema(t *testing.T) {
+	opts := Options{
+		Type:                TypeTempSchema,
+		Instance:            s.d.Instance,
+		SchemaName:          "_skeema_tmp",
+		DefaultCharacterSet: "latin1",
+		DefaultCollation:    "latin1_swedish_ci",
+		LockTimeout:         100 * time.Millisecond,
+		CreateThreads:       6,
+		CreateChunkSize:     1,
+		DropChunkSize:       1,
+	}
+
+	// First confirm the normal flow of creation and cleanup works as expected
+	ts, err := NewTempSchema(opts)
+	if err != nil {
+		t.Fatalf("Unexpected error from NewTempSchema: %s", err)
+	}
+	if _, err := NewTempSchema(opts); err == nil {
+		t.Fatal("Expected error from already-locked NewTempSchema, instead err is nil")
+	}
+	if ts.inst != s.d.Instance {
+		t.Error("Expected inst to be same instance as dockerized instance, but it was not")
+	}
+	if has, err := ts.inst.HasSchema(opts.SchemaName); !has {
+		t.Errorf("Instance does not have expected schema: has=%t err=%s", has, err)
+	}
+	if err := ts.Cleanup(nil); err != nil {
+		t.Errorf("Unexpected error from cleanup: %s", err)
+	}
+	if has, _ := ts.inst.HasSchema(opts.SchemaName); has {
+		t.Fatal("Schema persisted despite having run Cleanup")
+	}
+	if err := ts.Cleanup(nil); err == nil {
+		t.Error("Expected repeated calls to Cleanup() to error, but err was nil")
+	}
+
+	// Create the workspace again and this time don't run Cleanup; instead just
+	// hackily release the lock, to simulate an unclean state
+	ts, err = NewTempSchema(opts)
+	if err != nil {
+		t.Fatalf("Unexpected error from NewTempSchema: %s", err)
+	}
+	ts.releaseLock()
+	ts.releaseLock = nil
+
+	// After above, _skeema_tmp exists and has tables but without any rows. Calling
+	// NewTempSchema should succeed since it will do initial cleanup automatically
+	// as long as the tables don't have rows.
+	ts, err = NewTempSchema(opts)
+	if err != nil {
+		t.Fatalf("Unexpected error from NewTempSchema: %s", err)
+	}
+	if has, err := ts.inst.HasSchema(opts.SchemaName); !has {
+		t.Errorf("Instance does not have expected schema: has=%t err=%s", has, err)
+	}
+
+	// Insert a row and then attempt to call Cleanup, which should fail because a
+	// table is non-empty
+	s.d.SourceSQL(t, "testdata/tempschema1.sql")
+	if err := ts.Cleanup(nil); err == nil {
+		t.Fatal("Expected cleanup error since a table wasn't empty, but err was nil")
+	}
+
+	// NewTempSchema should fail if schema already exists and a table has rows,
+	// and it should not drop the schema or non-empty table
+	if _, err = NewTempSchema(opts); err == nil {
+		t.Fatal("Expected NewTempSchema error since a table had rows, but err was nil")
+	}
+	if schema, err := s.d.Schema("_skeema_tmp"); err != nil {
+		t.Errorf("Unexpected error getting schema _skeema_tmp: %s", err)
+	} else if !schema.HasTable("bar") {
+		t.Error("Expected table bar to still exist, but it does not")
+	}
+}
+
+// TestTempSchemaCrossDBFK confirms that TempSchema workspaces properly use
+// lock_wait_timeout in MySQL 8.0 to reduce problems with cross-schema foreign
+// keys and metadata locking. This is necessary because MySQL 8.0 extends
+// metadata locks across both sides of an FK, which can be problematic with DDL.
+func (s WorkspaceIntegrationSuite) TestTempSchemaCrossDBFK(t *testing.T) {
+	// TODOv2: evaluate which MariaDB versions this may now be relevant to, as
+	// they've changed their FK locking behavior a couple times now; and then
+	// adjust conditional accordingly
+	if !s.d.Flavor().IsMySQL() {
+		t.Skip("Test only relevant for flavors that extend metadata locks across FK relations")
+	}
+
+	s.d.SourceSQL(t, "testdata/crossdbfk-setup1.sql")
+
+	dir := s.getParsedDir(t, "testdata/crossdbfk", "")
+	opts, err := OptionsForDir(dir, s.d.Instance)
+	if err != nil {
+		t.Fatalf("Unexpected error from OptionsForDir: %s", err)
+	}
+	opts.CreateChunkSize = 1 // disable CREATE chunking to ensure there isn't an extra retry below
+
+	// If nothing holding locks on parent side, workspace should be fine
+	wsSchema, err := ExecLogicalSchema(dir.LogicalSchemas[0], opts)
+	if err != nil {
+		t.Errorf("Unexpected error from ExecLogicalSchema with nothing holding MDL: %v", err)
+	} else if len(wsSchema.Failures) > 0 {
+		t.Errorf("Unexpected %d failures from ExecLogicalSchema with nothing holding MDL; first err %v from %s", len(wsSchema.Failures), wsSchema.Failures[0].Err, wsSchema.Failures[0].Statement.Location())
+	}
+
+	// This function obtains SHARED_READ MDL for the specified duration, in the
+	// background. Since DDL requires EXCLUSIVE MDL, DDL will be blocked until this
+	// query completes, although this function will return immediately.
+	holdMDL := func(tableName string, seconds int) {
+		db, err := s.d.CachedConnectionPool("", "")
+		if err != nil {
+			panic(fmt.Errorf("Unexpected error from ConnectionPool: %v", err))
+		}
+		go func() {
+			var x, y int
+			query := fmt.Sprintf("SELECT id, SLEEP(?) FROM `parent_side`.%s LIMIT 1", tengo.EscapeIdentifier(tableName))
+			err := db.QueryRow(query, seconds).Scan(&x, &y)
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+
+	// Note: ordinarily, TempSchema uses a 5-second lock_wait_timeout, with one
+	// retry for each DDL. However, in test suites, it automatically uses a 2-
+	// second lock_wait_timeout instead, to prevent these tests from being slow.
+
+	// Holding the lock for under 4 seconds shouldn't result in workspace failures.
+	// The first test here should succeed quickly; the second one slightly more
+	// slowly since it will do a retry.
+	holdMDL("p1", 1)
+	wsSchema, err = ExecLogicalSchema(dir.LogicalSchemas[0], opts)
+	if err != nil {
+		t.Errorf("Unexpected error from ExecLogicalSchema with 1-sec MDL: %v", err)
+	} else if len(wsSchema.Failures) > 0 {
+		t.Errorf("Unexpected %d failures from ExecLogicalSchema with 1-sec MDL; first err %v from %s", len(wsSchema.Failures), wsSchema.Failures[0].Err, wsSchema.Failures[0].Statement.Location())
+	}
+	holdMDL("p2", 3)
+	wsSchema, err = ExecLogicalSchema(dir.LogicalSchemas[0], opts)
+	if err != nil {
+		t.Errorf("Unexpected error from ExecLogicalSchema with 3-sec MDL: %v", err)
+	} else if len(wsSchema.Failures) > 0 {
+		t.Errorf("Unexpected %d failures from ExecLogicalSchema with 3-sec MDL; first err %v from %s", len(wsSchema.Failures), wsSchema.Failures[0].Err, wsSchema.Failures[0].Statement.Location())
+	}
+
+	// Holding the lock for over 4 seconds should result in workspace failures
+	// (2-second lock_wait_timeout in tests, x 2 attempts)
+	holdMDL("p1", 5)
+	wsSchema, err = ExecLogicalSchema(dir.LogicalSchemas[0], opts)
+	if err != nil {
+		t.Errorf("Unexpected error from ExecLogicalSchema with 5-sec MDL (which should have resulted in statement failures but not overall error): %v", err)
+	} else if len(wsSchema.Failures) == 0 {
+		t.Error("Expected at least one statement failure from ExecLogicalSchema with 5-sec MDL; instead found 0")
+	}
+
+	// Now test cleanup logic vs MDL. This involves hackily setting up a temp
+	// schema. Here we'll use a 1-second lock_wait_timeout.
+	getTempSchema := func() *TempSchema {
+		// This file re-populates _skeema_tmp as if a workspace was set up but not
+		// cleaned up yet.
+		s.d.SourceSQL(t, "testdata/crossdbfk-setup2.sql")
+		tempSchema := &TempSchema{
+			schemaName:    "_skeema_tmp",
+			dropChunkSize: 3,
+			inst:          s.d.Instance,
+			mdlTimeout:    1,
+		}
+		if tempSchema.releaseLock, err = getLock(tempSchema.inst, "skeema._skeema_tmp", opts.LockTimeout); err != nil {
+			t.Fatalf("Unable to lock temporary schema on Dockerized instance: %v", err)
+		}
+		return tempSchema
+	}
+
+	// 1-second mdl conflict should still allow cleanup to succeed
+	ts := getTempSchema()
+	holdMDL("p2", 1)
+	if err := ts.Cleanup(nil); err != nil {
+		t.Fatalf("Expected cleanup to succeed with 1-sec MDL; instead found error %v", err)
+	}
+
+	// 3-second mdl conflict should cause cleanup to fail
+	ts = getTempSchema()
+	holdMDL("p1", 3)
+	if err := ts.Cleanup(nil); err == nil {
+		t.Fatal("Expected cleanup to fail with 3-sec MDL; instead error is nil")
+	}
+}
+
+func TestTempSchemaNilInstance(t *testing.T) {
+	opts := Options{
+		Type:                TypeTempSchema,
+		Instance:            nil,
+		SchemaName:          "_skeema_tmp",
+		DefaultCharacterSet: "latin1",
+		DefaultCollation:    "latin1_swedish_ci",
+		LockTimeout:         100 * time.Millisecond,
+		CreateThreads:       6,
+	}
+	if _, err := NewTempSchema(opts); err == nil {
+		t.Fatal("Expected non-nil error from NewTempSchema, but return was nil")
+	}
+}

@@ -1,0 +1,17 @@
+CREATE;
+CREATE DEFINER `not enough tokens`;
+CREATE DEFINER =;
+CREATE DEFINER = `somerole`;
+CREATE DEFINER 'meep'@'moop' PROCEDURE `foo` SELECT 'skipped equals sign in definer';
+CREATE DEFINER = 2 procedure foo select 'invalid definer name';
+CREATE DEFINER = foo @ '%' PROCEDURE bad_definer_spacing SELECT 1;
+CREATE DEFINER = foo@% PROCEDURE bad_definer_unquoted SELECT 1;
+CREATE or RECOMBOBULATE FUNCTION funccuruserparens() RETURNS int RETURN 42;
+CREATE OR REPLACE;
+CREATE definer=root@localhost PROCFUNC `whoops` select 'procfunc is not a valid type of routine';
+CREATE TABLE;
+CREATE TABLE 123 (id int);
+CREATE TABLE . (id int);
+CREATE TABLE foo. (id int);
+CREATE TABLE foo.bar.baz (id int);
+CREATE TABLE foo.* (id int);

@@ -1,0 +1,15 @@
+lint-pk = ERROR
+lint-charset = warning
+skip-lint-display-width
+
+allow-charset=utf8mb4
+allow-engine=innodb, myisam
+allow-definer='root'@'%',procbot@127.0.0.1
+
+ignore-table=^_
+
+schema=whatever
+default-character-set=latin1
+default-collation=latin1_swedish_ci
+
+allow-pk-type=smallint,int,bigint,varbinary
